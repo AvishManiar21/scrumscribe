@@ -19,19 +19,43 @@ from pathlib import Path
 from ..transcript import Transcript, Utterance
 
 TEXT_COLS = ("text", "transcript", "content", "sentence", "body", "message", "chunk")
-START_COLS = ("start", "start_time", "starttime", "begin", "timestamp", "offset", "ts", "time")
-END_COLS = ("end", "end_time", "endtime", "stop")
+# Order matters: the first exact match wins. Meetily's `transcripts` table has
+# both `audio_start_time` (a float offset into the recording, what we want) and
+# `timestamp` (a wall-clock string, which parses to nothing), so the audio
+# columns are listed first.
+START_COLS = (
+    "audio_start_time", "start", "start_time", "starttime", "begin",
+    "offset", "timestamp", "ts", "time",
+)
+END_COLS = ("audio_end_time", "end", "end_time", "endtime", "stop")
 SPEAKER_COLS = ("speaker", "speaker_label", "speaker_name", "who", "participant", "source")
 MEETING_COLS = ("meeting_id", "meetingid", "session_id", "sessionid", "recording_id", "call_id")
 TITLE_COLS = ("title", "name", "subject", "meeting_name")
 DATE_COLS = ("created_at", "createdat", "date", "started_at", "timestamp", "updated_at")
 
 
+SQLITE_MAGIC = b"SQLite format 3" + bytes(1)
+
+
+def is_sqlite(path: Path) -> bool:
+    """True when a file really is a SQLite database, by its header bytes."""
+    if path.suffix.lower() in (".wal", ".shm", ".journal"):
+        return False
+    try:
+        with path.open("rb") as fh:
+            return fh.read(16) == SQLITE_MAGIC
+    except OSError:
+        return False
+
+
 def default_db_paths() -> list[Path]:
-    """Probable Meetily database locations on this machine.
+    """Probable Meetily database locations on this machine, best first.
 
     Tauri apps store data under an identifier-named folder in APPDATA, so we
-    glob rather than guess the exact bundle id.
+    glob rather than guess the exact bundle id. That glob is blunt: Meetily
+    embeds a WebView2 browser whose Chromium profile lives in the same tree and
+    contains dozens of unrelated SQLite files. Candidates are therefore ranked,
+    and the caller confirms the choice by opening it.
     """
     roots: list[Path] = []
     for env in ("APPDATA", "LOCALAPPDATA"):
@@ -51,15 +75,65 @@ def default_db_paths() -> list[Path]:
             except OSError:
                 continue
 
-    # De-duplicate, newest first -- the active database is the one just written.
-    unique = {p.resolve(): p for p in found}
-    return sorted(unique.values(), key=lambda p: p.stat().st_mtime, reverse=True)
+    candidates = [p for p in {p.resolve(): p for p in found}.values() if is_sqlite(p)]
+    candidates = [p for p in candidates if not _is_browser_storage(p)]
+    return sorted(candidates, key=_rank, reverse=True)
+
+
+# Meetily bundles a WebView2 runtime; its Chromium profile sits in the same
+# application data folder and is full of SQLite files that are not ours.
+_BROWSER_DIRS = {
+    "ebwebview", "cache", "code cache", "gpucache", "dawncache",
+    "local storage", "session storage", "indexeddb", "service worker",
+    "shared proto db", "extension state", "blob_storage", "network",
+}
+
+
+def _is_browser_storage(path: Path) -> bool:
+    return any(part.lower() in _BROWSER_DIRS for part in path.parts)
+
+
+def _rank(path: Path) -> tuple:
+    """Rank a candidate: name relevance first, then recency."""
+    name = path.name.lower()
+    score = 0
+    if "meeting" in name:
+        score += 4
+    if "meetily" in name:
+        score += 3
+    if name.endswith((".sqlite", ".sqlite3")):
+        score += 1
+    try:
+        mtime = path.stat().st_mtime
+    except OSError:
+        mtime = 0.0
+    return (score, mtime)
+
+
+def has_transcript_table(path: Path) -> bool:
+    """Open a candidate and check it actually holds meeting transcripts."""
+    try:
+        with MeetilyStore(path) as store:
+            return store.best is not None
+    except (sqlite3.Error, OSError, ValueError):
+        return False
 
 
 def find_db(explicit: Path | None = None) -> Path | None:
+    """Locate Meetily's meeting database.
+
+    An explicit path is taken at face value beyond a sanity check. Otherwise
+    candidates are tried in rank order and the first one that actually contains
+    a transcript table wins -- filename heuristics alone picked a WebView2
+    internal database on a real installation.
+    """
     if explicit:
-        return explicit if explicit.is_file() else None
+        return explicit if explicit.is_file() and is_sqlite(explicit) else None
+
     candidates = default_db_paths()
+    for candidate in candidates:
+        if has_transcript_table(candidate):
+            return candidate
     return candidates[0] if candidates else None
 
 
@@ -105,6 +179,18 @@ def _num(value) -> float | None:
         return None
     # Heuristic: values this large are milliseconds, not seconds.
     return number / 1000 if number > 100_000 else number
+
+
+def _looks_like_transcript_schema(table: str, columns: list[str]) -> bool:
+    """Recognise a transcript table by its columns when it holds no rows yet."""
+    lowered = {c.lower() for c in columns}
+    named = "transcript" in table.lower()
+    has_speaker = any("speaker" in c for c in lowered)
+    has_timing = any(
+        c.startswith(("audio_start", "start", "begin")) or c == "timestamp" for c in lowered
+    )
+    has_meeting = any(c in lowered for c in MEETING_COLS)
+    return named and (has_speaker or has_timing or has_meeting)
 
 
 class MeetilyStore:
@@ -153,7 +239,11 @@ class MeetilyStore:
                 continue
 
             samples = [r["t"] for r in rows if isinstance(r["t"], str) and r["t"].strip()]
-            if not samples:
+            # An empty table is still a transcript table. Meetily only writes
+            # rows when a meeting is saved in the app, so a fresh install has
+            # the right schema and no data -- refusing to recognise it there
+            # turns a normal state into a scary [FAIL] in the diagnostics.
+            if not samples and not _looks_like_transcript_schema(table, columns):
                 continue
 
             tm = TableMap(
@@ -168,7 +258,7 @@ class MeetilyStore:
             tm.order_by = tm.start or ("id" if "id" in lower_cols else None)
 
             # A transcript table has many rows of short-to-medium utterances.
-            avg_len = sum(len(s) for s in samples) / len(samples)
+            avg_len = (sum(len(s) for s in samples) / len(samples)) if samples else 0
             score = len(samples)
             if "transcript" in table.lower():
                 score += 100
@@ -178,10 +268,14 @@ class MeetilyStore:
                 score += 20
             if tm.meeting:
                 score += 10
-            if 10 <= avg_len <= 600:
+            if samples and 10 <= avg_len <= 600:
                 score += 25
             elif avg_len > 5000:
                 score -= 50  # this is a summary/notes blob, not utterances
+            if not samples:
+                # Recognised on shape alone; never let it outrank a table that
+                # actually has content in it.
+                score = min(score, 5)
             tm.score = score
             maps.append(tm)
 

@@ -68,10 +68,10 @@ and tells you exactly what to run if something is missing.
 # From any transcript: Teams .vtt export, Whisper .json, plain text
 scrumscribe notes weekly-scrum.vtt
 
-# Straight from Meetily's database
-scrumscribe meetily --list
-scrumscribe meetily                    # exports the most recent meeting
-scrumscribe notes ~/.scrumscribe/transcripts/<id>.txt
+# Straight from Meetily
+scrumscribe meetily --list             # recordings, newest first
+scrumscribe meetily                    # exports the most recent one
+scrumscribe notes ~/.scrumscribe/transcripts/<name>.txt
 
 # Cross-meeting memory
 scrumscribe open                       # what is still outstanding
@@ -90,6 +90,7 @@ repo, so meeting content is never at risk of being committed. Override with
 
 | Source | Detection |
 |---|---|
+| Meetily recording folder | `metadata.json` + `transcripts.json` in a directory |
 | Meetily database | SQLite magic bytes, schema discovered at runtime |
 | Microsoft Teams `.vtt` | `WEBVTT` header, `<v Speaker>` tags |
 | Whisper / faster-whisper `.json` | segment list found by structure, fields by alias |
@@ -115,6 +116,23 @@ transcript ──► ingest ──► speaker turns ──► disjoint chunks
 ```
 
 Design decisions that matter, and why:
+
+**Read the recording folders, not just the database.** Meetily writes each
+session to its own directory (`audio.mp4`, `metadata.json`, `transcripts.json`)
+and only writes rows to SQLite once a meeting is *saved* in the app. A
+recording that was made but never saved is complete on disk and entirely
+absent from the database. The folders are also readable while the app is open,
+which the database is not reliably. So folders are preferred and the database
+is the fallback.
+
+Finding that database is less obvious than it sounds. Meetily embeds a WebView2
+runtime whose Chromium profile lives in the same application data folder and
+contains dozens of unrelated SQLite files — a filename-and-recency heuristic
+picks `EBWebView/Default/declarative_performance_observer.db`. SQLite's own
+`-wal` sidecar is worse: it matches a `*.sqlite*` glob and is always the most
+recently written of the three, so "newest match" opens a file that is not a
+database at all. Candidates are ranked, browser storage is excluded, and the
+choice is confirmed by opening the file and looking for a transcript table.
 
 **Capture is somebody else's job.** Meetily already solves recording well.
 Building another audio pipeline would have been the fragile part of this project

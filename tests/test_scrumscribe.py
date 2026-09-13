@@ -8,6 +8,7 @@ must not regress, and the part a model-dependent test could never pin down.
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 from pathlib import Path
 
@@ -24,7 +25,13 @@ from scrumscribe.agent.loop import (
 )
 from scrumscribe.agent.schema import ActionItem, Item, ScrumNotes
 from scrumscribe.ingest import detect, load
-from scrumscribe.ingest.meetily import MeetilyStore
+from scrumscribe.ingest import meetily_folder
+from scrumscribe.ingest.meetily import (
+    MeetilyStore,
+    default_db_paths,
+    find_db,
+    is_sqlite,
+)
 from scrumscribe.memory import Memory
 from scrumscribe.model import chunk, estimate_tokens
 from scrumscribe.model.ollama import _salvage_json
@@ -525,3 +532,145 @@ def test_retrieval_matches_on_word_stems():
     """"batch" must find "batching"."""
     lines = _retrieve("Batch appointment history", _week2().utterances)
     assert any("batching working" in line for line in lines)
+
+
+# -- database discovery on disk -----------------------------------------------
+
+
+def test_wal_and_shm_sidecars_are_not_databases(tmp_path):
+    """SQLite's sidecars match a *.sqlite* glob and the -wal is the newest file.
+
+    Sorting candidates by modification time therefore puts the write-ahead log
+    first, and opening it fails with "file is not a database".
+    """
+    real = tmp_path / "meeting_minutes.sqlite"
+    real.write_bytes((FIXTURES / "fake_meetily.db").read_bytes())
+    (tmp_path / "meeting_minutes.sqlite-wal").write_bytes(b"\x00" * 512)
+    (tmp_path / "meeting_minutes.sqlite-shm").write_bytes(b"\x00" * 512)
+
+    assert is_sqlite(real)
+    assert not is_sqlite(tmp_path / "meeting_minutes.sqlite-wal")
+    assert not is_sqlite(tmp_path / "meeting_minutes.sqlite-shm")
+
+
+def test_find_db_rejects_a_non_database(tmp_path):
+    impostor = tmp_path / "notes.sqlite"
+    impostor.write_text("this is not a database", encoding="utf-8")
+    assert find_db(impostor) is None
+
+
+def test_empty_schema_is_still_recognised(tmp_path):
+    """A fresh Meetily install has the right tables and no rows in them."""
+    db = tmp_path / "empty.sqlite"
+    conn = sqlite3.connect(db)
+    conn.execute(
+        "CREATE TABLE transcripts (id TEXT, meeting_id TEXT, transcript TEXT, "
+        "timestamp TEXT, audio_start_time REAL, audio_end_time REAL, speaker TEXT)"
+    )
+    conn.execute("CREATE TABLE settings (id TEXT, content TEXT)")
+    conn.commit()
+    conn.close()
+
+    with MeetilyStore(db) as store:
+        assert store.best is not None
+        assert store.best.table == "transcripts"
+        # audio_start_time must win over the wall-clock `timestamp` column.
+        assert store.best.start == "audio_start_time"
+        assert store.best.speaker == "speaker"
+
+
+def test_webview_storage_is_excluded(tmp_path, monkeypatch):
+    """Meetily embeds WebView2; its Chromium profile is full of SQLite files.
+
+    Filename heuristics alone picked `declarative_performance_observer.db` out
+    of `EBWebView/Default/` on a real installation.
+    """
+    appdata = tmp_path / "Roaming"
+    real = appdata / "com.meetily.ai" / "meeting_minutes.sqlite"
+    webview = appdata / "com.meetily.ai" / "EBWebView" / "Default" / "perf.db"
+    for target in (real, webview):
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes((FIXTURES / "fake_meetily.db").read_bytes())
+    # Make the decoy the most recently written file.
+    os.utime(webview, (2_000_000_000, 2_000_000_000))
+
+    monkeypatch.setenv("APPDATA", str(appdata))
+    monkeypatch.setenv("LOCALAPPDATA", str(appdata))
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path))
+
+    assert webview not in default_db_paths()
+    assert find_db() == real.resolve()
+
+
+# -- meetily recording folders ------------------------------------------------
+
+
+def _make_recording(root: Path, name: str, segments: list[dict], status: str = "completed"):
+    folder = root / name
+    folder.mkdir(parents=True, exist_ok=True)
+    (folder / "metadata.json").write_text(
+        json.dumps(
+            {
+                "meeting_name": name,
+                "created_at": "2026-09-13T18:06:16.228372800+00:00",
+                "status": status,
+                "audio_file": "audio.mp4",
+                "meeting_id": None,
+                "devices": {"microphone": "Mic", "system_audio": "Speakers"},
+            }
+        ),
+        encoding="utf-8",
+    )
+    (folder / "transcripts.json").write_text(
+        json.dumps({"segments": segments, "total_segments": len(segments), "version": "1.0"}),
+        encoding="utf-8",
+    )
+    (folder / "audio.mp4").write_bytes(b"\x00" * 2048)
+    return folder
+
+
+def test_recording_folder_is_detected_and_loaded(tmp_path):
+    folder = _make_recording(
+        tmp_path,
+        "Meeting 13_09_26",
+        [
+            {"start": 0.0, "end": 4.0, "text": "I finished the sync", "speaker": "Avish"},
+            {"start": 4.5, "end": 8.0, "text": "Good work.", "speaker": "Dr. Chen"},
+        ],
+    )
+    assert detect(folder) == "meetily-recording"
+    t = load(folder)
+    assert t.speakers == ["Avish", "Dr. Chen"]
+    assert t.title == "Meeting 13_09_26"
+    assert t.meeting_date == "2026-09-13"
+
+
+def test_recordings_root_picks_the_newest(tmp_path):
+    _make_recording(tmp_path, "older", [{"text": "old one", "speaker": "A"}])
+    newer = _make_recording(tmp_path, "newer", [{"text": "new one", "speaker": "A"}])
+    os.utime(newer, (2_000_000_000, 2_000_000_000))
+
+    assert detect(tmp_path) == "meetily-recordings-root"
+    assert "new one" in load(tmp_path).render()
+
+
+def test_empty_recording_explains_itself(tmp_path):
+    """A silent or too-short recording produces audio but no segments."""
+    folder = _make_recording(tmp_path, "silent", [])
+    with pytest.raises(ValueError, match="no transcript segments"):
+        load(folder)
+
+
+def test_describe_reports_recording_state(tmp_path):
+    folder = _make_recording(tmp_path, "Meeting X", [{"text": "hello", "speaker": "A"}])
+    info = meetily_folder.describe(folder)
+    assert info["segments"] == 1
+    assert info["status"] == "completed"
+    assert info["saved_to_db"] is False
+    assert info["audio_bytes"] == 2048
+
+
+def test_plain_directory_is_rejected(tmp_path):
+    (tmp_path / "notes").mkdir()
+    with pytest.raises(IsADirectoryError, match="Meetily recording"):
+        detect(tmp_path / "notes")

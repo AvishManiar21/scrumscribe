@@ -18,6 +18,7 @@ from .agent import ScrumAgent
 from .agent.prompts import STANDUP_SYSTEM, standup_prompt
 from .context import git_context
 from .ingest import detect, load
+from .ingest import meetily_folder
 from .ingest.meetily import MeetilyStore, find_db
 from .memory import Memory
 from .model import Ollama, OllamaError
@@ -111,7 +112,60 @@ def cmd_notes(args) -> int:
     return 0
 
 
+def _from_recordings(args, root: Path, recordings: list[Path]) -> int:
+    _echo(f"recordings: {root}")
+
+    if args.list:
+        for i, rec in enumerate(recordings):
+            info = meetily_folder.describe(rec)
+            marker = "*" if i == 0 else " "
+            saved = "saved" if info["saved_to_db"] else "unsaved"
+            print(
+                f"{marker} {info['created']}  {info['segments']:>5} segments  "
+                f"{info['audio_bytes'] // 1024:>6} KB  {saved:>7}  {info['name']}"
+            )
+        _echo("\n(* = most recent)")
+        return 0
+
+    target = recordings[0]
+    if args.meeting:
+        matches = [r for r in recordings if args.meeting.lower() in r.name.lower()]
+        if not matches:
+            _echo(f"error: no recording matching '{args.meeting}'")
+            return 2
+        target = matches[0]
+
+    try:
+        transcript = load(target)
+    except ValueError as exc:
+        _echo(f"error: {exc}")
+        return 1
+
+    out = Path(args.output) if args.output else config.home() / "transcripts" / f"{target.name}.txt"
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(transcript.render(), encoding="utf-8")
+    _echo(
+        f"exported {len(transcript)} speaker turns "
+        f"({transcript.word_count()} words) to {out}"
+    )
+    _echo(f'\nnext:  scrumscribe notes "{out}"')
+    return 0
+
+
 def cmd_meetily(args) -> int:
+    """Read from Meetily.
+
+    Recording folders are preferred over the database. Meetily only writes rows
+    to SQLite once a meeting is saved in the app, so a recording that was made
+    but never saved is on disk and absent from the database entirely.
+    """
+    root = Path(args.recordings) if args.recordings else config.recordings_dir()
+    if root and not args.db:
+        recordings = meetily_folder.list_recordings(root)
+        if recordings:
+            return _from_recordings(args, root, recordings)
+        _echo(f"note: {root} exists but holds no recordings yet")
+
     db = find_db(Path(args.db) if args.db else None)
     if not db:
         _echo(
@@ -262,6 +316,31 @@ def cmd_doctor(args) -> int:
     else:
         print("[--]   Memory: not created yet (first run will create it)")
 
+    root = Path(args.recordings) if args.recordings else config.recordings_dir()
+    if root:
+        recordings = meetily_folder.list_recordings(root)
+        print(f"[ok]   Meetily recordings: {root}")
+        if recordings:
+            usable = 0
+            for rec in recordings[:5]:
+                info = meetily_folder.describe(rec)
+                flag = "ok" if info["segments"] else "--"
+                usable += bool(info["segments"])
+                print(
+                    f"[{flag}]     {info['name']}  {info['segments']} segments, "
+                    f"{info['audio_bytes'] // 1024} KB audio, {info['status']}"
+                )
+            if not usable:
+                print(
+                    "       none of these have a transcript yet. Meetily records audio\n"
+                    "       and transcribes separately -- a silent or very short recording,\n"
+                    "       or one made while the model was still downloading, produces none."
+                )
+        else:
+            print("[--]     no recordings yet")
+    else:
+        print("[--]   Meetily recordings folder not found")
+
     db = find_db(Path(args.db) if args.db else None)
     if db:
         print(f"[ok]   Meetily database: {db}")
@@ -279,8 +358,10 @@ def cmd_doctor(args) -> int:
                         for candidate in store.tables:
                             print(f"         candidate: {candidate}")
                 else:
-                    ok = False
-                    print("[FAIL] No transcript-shaped table found in that database")
+                    print(
+                        "[--]   No transcript table found in that database "
+                        "(normal before the first meeting is saved)"
+                    )
         except Exception as exc:  # noqa: BLE001 - diagnostics must never crash
             ok = False
             print(f"[FAIL] Could not read database: {exc}")
@@ -325,6 +406,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_meetily = sub.add_parser("meetily", help="read transcripts from Meetily's database")
     p_meetily.add_argument("--db", help="path to the Meetily database")
+    p_meetily.add_argument("--recordings", help="path to Meetily's recordings folder")
     p_meetily.add_argument("--list", action="store_true", help="list meetings and exit")
     p_meetily.add_argument("--meeting", help="meeting id to export (default: most recent)")
     p_meetily.add_argument("-o", "--output", help="write the transcript here")
@@ -349,6 +431,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_doctor = sub.add_parser("doctor", help="check the setup end to end")
     p_doctor.add_argument("--db", help="path to a Meetily database to inspect")
+    p_doctor.add_argument("--recordings", help="path to Meetily's recordings folder")
     p_doctor.add_argument("-v", "--verbose", action="store_true")
     p_doctor.set_defaults(func=cmd_doctor)
 

@@ -12,11 +12,18 @@ import json
 from pathlib import Path
 
 from ..transcript import Transcript, clean as clean_text
-from . import json_ingest, meetily, text, vtt
+from . import json_ingest, meetily, meetily_folder, text, vtt
 
 __all__ = ["load", "detect", "SUPPORTED"]
 
-SUPPORTED = ("meetily-sqlite", "vtt", "srt", "json", "text")
+SUPPORTED = (
+    "meetily-recording",
+    "meetily-sqlite",
+    "vtt",
+    "srt",
+    "json",
+    "text",
+)
 
 _SQLITE_MAGIC = b"SQLite format 3\x00"
 
@@ -28,7 +35,15 @@ def detect(path: Path) -> str:
     several extensions across releases (.db, .sqlite, .sqlite3).
     """
     if path.is_dir():
-        raise IsADirectoryError(f"{path} is a directory, not a transcript file")
+        # Meetily writes one directory per recording. Pointing at the recording,
+        # or at the folder holding all of them, are both reasonable things to do.
+        if meetily_folder.is_recording_dir(path):
+            return "meetily-recording"
+        if meetily_folder.is_recordings_root(path):
+            return "meetily-recordings-root"
+        raise IsADirectoryError(
+            f"{path} is a directory, and does not look like a Meetily recording"
+        )
 
     try:
         with path.open("rb") as fh:
@@ -80,7 +95,14 @@ def load(
     path = Path(path)
     kind = detect(path)
 
-    if kind == "meetily-sqlite":
+    if kind == "meetily-recording":
+        transcript = meetily_folder.load(path)
+    elif kind == "meetily-recordings-root":
+        recordings = meetily_folder.list_recordings(path)
+        if not recordings:
+            raise ValueError(f"no recordings found under {path}")
+        transcript = meetily_folder.load(recordings[0])
+    elif kind == "meetily-sqlite":
         transcript = meetily.load(path, meeting_id)
     elif kind in ("vtt", "srt"):
         # The SRT cue grammar is a subset of what the VTT parser accepts.
