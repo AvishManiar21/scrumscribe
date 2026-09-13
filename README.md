@@ -135,26 +135,43 @@ here own their content exclusively, so forward progress is structural.
 JSON Schema, so output is valid by construction. Asking a small model politely
 for JSON produces parse failures on a meaningful fraction of chunks.
 
-**Resolution reads the transcript, not the summary.** Evidence that a commitment
-is finished is conversational — *"yes, I sent it Thursday night"* — and
-extraction files that under neither progress nor decision, so it never reaches
-the extracted facts. Checking against the summary reports that nothing was ever
-completed, which is worse than not checking: finished work sits on the open list
-forever.
+**Resolution is retrieval first, judgement second.** Deciding which past
+commitments a meeting closed is the hardest part of this, and the obvious
+designs all fail at 4B. Asked *"which of these six numbered items were
+resolved"*, the model returns an empty list essentially always. Asked about one
+item and told to quote its evidence, it returns a real, completion-sounding
+sentence about a **different** task — asked whether "start on RLS" was done, it
+quotes *"Yes, I sent it Thursday night"*, which passes every check because the
+quote is genuine and does describe a completion.
 
-**One question per item.** Asking *"which of these six numbered items were
-resolved"* returns an empty list from a 4B model essentially always, no matter
-how the prompt is worded. Decomposed into one focused yes/no question per item,
-it answers correctly. Small models need the problem cut up for them.
+So the search is done deterministically. Lines sharing vocabulary with the task
+are retrieved by stem match, ranked by strength, and pulled in with their
+neighbours — the proof is usually the reply, not the line that matched. The
+model then only judges lines already known to be on topic, which it does well.
 
-**Claimed resolutions must be provable.** Every closure comes with a quote, and
-the quote is checked against the transcript before it is believed. Closing an
-item on invented evidence makes real work vanish from your list — the one
-failure this tool must not have.
+**Every gate fails closed.** A claimed resolution must quote real transcript
+text, must not read as future tense or negation, and must survive a second
+model call that sees the quote alone with no surrounding context to be swayed
+by. Any failure leaves the item open. Leaving finished work on the list is
+mildly annoying; deleting unfinished work from the only place it is recorded is
+the failure this tool must not have — so the bias is deliberate and one-sided.
 
 **Partial coverage is never hidden.** If sections fail, the count appears in the
 notes. A note that silently dropped three of seventeen sections looks exactly
 like a complete one, and that is how you end up trusting a lie.
+
+## Known limitations
+
+Resolution is tuned to under-close rather than over-close. On the test meetings
+it correctly closes clear completions ("yes, I sent it Thursday night") and
+correctly refuses explicit non-completions ("I haven't started it yet"), but
+leaves genuinely-finished-but-hedged items open — *"I emailed her but no reply
+yet, I'll follow up"* stays on the list. Close those by hand with
+`scrumscribe close`.
+
+Extraction quality varies run to run at this model size; consolidation usually
+merges duplicate action items but not always. Re-running is cheap and the
+transcript is unchanged, so a poor run costs nothing but time.
 
 ## Model choice
 

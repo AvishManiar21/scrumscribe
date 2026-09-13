@@ -69,57 +69,70 @@ Write the summary paragraph.
 # false even when the transcript said "yes, I sent it Thursday night".
 # Small models track the emphasis of a prompt more than its logic, so the
 # two cases are now given equal weight and stated in terms of tense.
+# Resolution judges retrieved candidate lines rather than searching the
+# whole transcript. Asked to find evidence in a full meeting, a 4B model
+# reliably returns a real, completion-sounding sentence about a different
+# task -- every downstream check passes it because the quote is genuine.
+# Deterministic retrieval removes the search problem and leaves the model
+# only the judgement, which it does well.
 RESOLUTION_SYSTEM = """\
-You check whether a task from a previous meeting got done, based on a meeting
-transcript.
+You decide whether a task from a previous meeting has been completed.
 
-Read the transcript and look for the person saying they did the task, or
-someone confirming it happened. Past-tense statements like "I sent it", "that
-is done", "it is loaded now", "solved" mean the task IS done.
+You are shown the lines from the current meeting that mention the task. Read
+them and decide.
 
-Future-tense statements like "I will do it this week", "I have not started" or
-"that is still on the list" mean the task is NOT done.
+Completed means someone states in the past tense that it happened: "I sent it",
+"it is loaded now", "that is done", "solved", "I emailed her".
 
-Set resolved to true if the task got done, and quote the sentence from the
-transcript that shows it, copied word for word.
-Set resolved to false if it did not, and leave the quote empty.
+Not completed means it was only planned, promised, requested, or explicitly not
+started: "I will do it this week", "I have not started", "that needs to happen",
+"so X first, then Y".
+
+If the lines only mention the task without saying it happened, it is not
+completed. Quote the exact line that decided it.
 """
 
 
-def resolution_prompt(item: str, section: str) -> str:
+def resolution_prompt(item: str, candidates: str) -> str:
     return f"""\
 Task from the previous meeting:
   {item}
 
-Transcript of the current meeting:
-{section}
+Lines from the current meeting that mention this task:
+{candidates}
 
-Did this task get done?
+Has this task been completed?
 """
 
 
 STANDUP_SYSTEM = """\
-You draft a short scrum status update that the user will read aloud in their
-next meeting.
+You draft a short scrum status update the user will read aloud in their next
+meeting.
 
 Write three labelled sections: "Since last time", "Blocked on", "Next".
-Use short bullet points. Ground every bullet in the supplied facts and commits.
-If there is nothing to say for a section, write "Nothing" under it.
-Do not invent work that is not in the inputs.
+
+The outstanding commitments you are given are things the user has NOT done yet.
+Never describe them as completed or started. They belong under "Next", or under
+"Blocked on" if something is stopping them.
+
+"Since last time" may only contain work evidenced by the git commits. If there
+are no commits, write "Nothing" under it rather than inventing progress.
+
+Use short bullets. Do not invent work that is not in the inputs.
 """
 
 
 def standup_prompt(open_items: list[str], commits: list[str], last_summary: str) -> str:
-    items = "\n".join(f"- {i}" for i in open_items) or "- (none)"
-    log = "\n".join(f"- {c}" for c in commits) or "- (no commits found)"
+    items = """\n""".join(f"- {i}" for i in open_items) or "- (none)"
+    log = """\n""".join(f"- {c}" for c in commits) or "- (no commits found)"
     return f"""\
-What I committed to at the last meeting:
+Outstanding commitments I have NOT completed yet:
 {items}
 
 What the last meeting covered:
-{last_summary or "(no previous summary)"}
+{last_summary}
 
-My git commits since then:
+My git commits since then (this is the only evidence of completed work):
 {log}
 
 Draft my status update.
@@ -155,4 +168,35 @@ Extracted action items, possibly containing duplicates:
 {listed}
 
 Return the merged list.
+"""
+
+# The second half of resolution. The search step is given the whole
+# transcript and is prone to returning a real sentence that mentions the
+# task without stating it was done -- a closing agenda line like "so RLS
+# first, then pricing" reads as relevant, and keyword screening cannot
+# tell it apart. This judge sees only the task and the quoted sentence,
+# with no surrounding context to be swayed by, and is reliably correct on
+# exactly the cases the search step gets wrong.
+CONFIRM_SYSTEM = """\
+You are given a task and a single sentence from a meeting.
+
+Decide whether that sentence, on its own, states that the task was ALREADY
+COMPLETED in the past.
+
+Answer true only for past-tense completion: "I sent it", "it is loaded now",
+"that is done", "solved".
+Answer false for anything else, including plans, reminders, agendas, requests,
+lists of what to do next, or statements that the task has not been started.
+"""
+
+
+def confirm_prompt(item: str, quote: str) -> str:
+    return f"""\
+Task:
+  {item}
+
+Sentence from the meeting:
+  {quote}
+
+Does this sentence say the task was already completed?
 """

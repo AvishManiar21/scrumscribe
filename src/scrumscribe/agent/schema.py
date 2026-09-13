@@ -163,6 +163,12 @@ RESOLUTION_SCHEMA = {
     "required": ["resolved", "evidence"],
 }
 
+CONFIRM_SCHEMA = {
+    "type": "object",
+    "properties": {"completed": {"type": "boolean"}},
+    "required": ["completed"],
+}
+
 EMPTY_EXTRACT = {
     "progress": [],
     "blockers": [],

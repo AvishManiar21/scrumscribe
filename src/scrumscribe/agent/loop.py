@@ -22,6 +22,7 @@ from ..model import Chunk, Ollama, chunk as split_chunks, estimate_tokens
 from ..transcript import Transcript
 from . import prompts
 from .schema import (
+    CONFIRM_SCHEMA,
     CONSOLIDATE_SCHEMA,
     EMPTY_EXTRACT,
     EXTRACT_SCHEMA,
@@ -307,87 +308,104 @@ class ScrumAgent:
     ) -> list[ActionItem]:
         """Find which carried-over commitments this meeting closed.
 
-        Two design decisions carry this feature.
+        Resolution is retrieval first, judgement second.
 
-        First, it reads the raw transcript rather than the extracted facts.
-        Evidence that a commitment is done is conversational -- "yes, I sent it
-        Thursday night" -- and extraction classifies that as neither progress
-        nor decision, so it never reaches the facts digest.
+        The obvious design -- hand the model the transcript and ask which items
+        were resolved -- fails in two different ways at this model size. Asked
+        about N numbered items at once it returns an empty list every time.
+        Asked about one item and told to quote its evidence, it returns a real,
+        completion-sounding sentence about a *different* task, which passes
+        every downstream check because the quote is genuine.
 
-        Second, it asks one yes/no question per item instead of asking which of
-        N numbered items were resolved. A 4B model given the list-of-indices
-        form returns an empty list almost every time, regardless of how the
-        prompt is worded: the indirection through numbers plus the scan over a
-        whole meeting is simply past what it can do in one step. Decomposed
-        into a single focused question it answers correctly. This costs one
-        call per open item and is the difference between the feature working
-        and silently never firing.
+        So the search is done deterministically: pick the lines that share
+        vocabulary with the task, plus their immediate replies, since
+        conversational evidence usually lives in the answer rather than the
+        question. The model then only judges lines already known to be on
+        topic, which it does reliably.
 
-        Every claimed resolution must come with a quote, and the quote is
-        checked against the transcript before it is believed.
+        Every gate fails closed. Leaving a finished item on the list is a small
+        annoyance; deleting unfinished work from the only place it is recorded
+        is the failure this must not have.
         """
         if not open_items or not chunks:
             return []
 
-        transcript_text = "\n".join(c.render() for c in chunks)
+        utterances = [u for c in chunks for u in c.utterances]
+        transcript_text = "\n".join(u.render() for u in utterances)
+
         resolved: list[ActionItem] = []
-
         for item in open_items:
-            verdict = self._check_one(item, chunks, transcript_text)
-            if verdict:
+            if self._check_one(item, utterances, transcript_text):
                 resolved.append(item)
-
         return resolved
 
-    def _check_one(
-        self, item: ActionItem, chunks: list[Chunk], transcript_text: str
-    ) -> bool:
-        """Ask whether one commitment was completed, and verify the answer."""
+    def _check_one(self, item: ActionItem, utterances: list, transcript_text: str) -> bool:
+        """Decide whether one commitment was completed."""
         label = f"{item.owner}: {item.label()}"
 
-        # Short meetings go in whole; long ones are scanned section by section
-        # until evidence turns up.
-        sections = [transcript_text]
-        if estimate_tokens(transcript_text) > self.max_tokens:
-            sections = [c.render() for c in chunks]
+        candidates = _retrieve(item.task, utterances)
+        if not candidates:
+            return False
 
-        for section in sections:
-            try:
-                result = self.client.chat_json(
-                    prompts.resolution_prompt(label, section),
-                    schema=RESOLUTION_SCHEMA,
-                    system=prompts.RESOLUTION_SYSTEM,
-                    default={},
-                )
-            except Exception as exc:  # noqa: BLE001
-                self.progress(f"  ! resolution check failed for '{item.task}': {exc}")
-                continue
+        listed = "\n".join(f"- {line}" for line in candidates)
+        try:
+            result = self.client.chat_json(
+                prompts.resolution_prompt(label, listed),
+                schema=RESOLUTION_SCHEMA,
+                system=prompts.RESOLUTION_SYSTEM,
+                default={},
+            )
+        except Exception as exc:  # noqa: BLE001
+            self.progress(f"  ! resolution check failed for '{item.task}': {exc}")
+            return False
 
-            if not result.get("resolved"):
-                continue
+        if not result.get("resolved"):
+            return False
 
-            evidence = _as_text(result.get("evidence"))
-            if not _evidence_supports_completion(evidence):
-                self.progress(
-                    f"  ! '{item.task}' claimed done, but the quoted evidence "
-                    "reads as unfinished — keeping it open"
-                )
-                continue
-            if not _quote_is_real(evidence, transcript_text):
-                # The model said yes but could not point at anything that was
-                # actually said. Closing an item on invented evidence is the
-                # worst outcome here -- it makes real work disappear from the
-                # open list -- so an unverifiable claim is refused.
-                self.progress(
-                    f"  ! '{item.task}' claimed done, but the quoted evidence "
-                    "is not in the transcript — keeping it open"
-                )
-                continue
+        evidence = _as_text(result.get("evidence"))
+        if not _quote_is_real(evidence, transcript_text):
+            self.progress(
+                f"  ! '{item.task}' claimed done, but the quoted evidence "
+                "is not in the transcript — keeping it open"
+            )
+            return False
 
-            self.progress(f"  resolved: {item.task}")
-            return True
+        if not _evidence_supports_completion(evidence):
+            self.progress(
+                f"  ! '{item.task}' claimed done, but the quoted evidence "
+                "reads as unfinished — keeping it open"
+            )
+            return False
 
-        return False
+        if not self._confirm(label, evidence):
+            self.progress(
+                f"  ! '{item.task}' claimed done, but the evidence does not "
+                "state it was completed — keeping it open"
+            )
+            return False
+
+        self.progress(f"  resolved: {item.task}")
+        return True
+
+    def _confirm(self, label: str, quote: str) -> bool:
+        """Second opinion on one quote, judged without surrounding context.
+
+        The search step reads the whole transcript and is easily satisfied by a
+        sentence that merely mentions the task. This judge sees only the task
+        and the sentence, so an agenda line or a restated promise has nothing
+        to lean on. Any failure here keeps the item open.
+        """
+        try:
+            result = self.client.chat_json(
+                prompts.confirm_prompt(label, quote),
+                schema=CONFIRM_SCHEMA,
+                system=prompts.CONFIRM_SYSTEM,
+                default={},
+            )
+        except Exception as exc:  # noqa: BLE001
+            self.progress(f"  ! confirmation failed for '{label}': {exc}")
+            return False
+        return bool(result.get("completed"))
 
     # -- orchestration --------------------------------------------------------
 
@@ -434,6 +452,55 @@ class ScrumAgent:
             notes.carried_over = [i for i in open_items if i.key() not in resolved_keys]
 
         return notes
+
+
+def _retrieve(task: str, utterances: list, limit: int = 8, window: int = 2) -> list[str]:
+    """Pull the lines of a meeting that are plausibly about a given task.
+
+    Matching is on four-character stems so "batch" finds "batching" and "start"
+    finds "started". Each hit brings its neighbours along, because the evidence
+    that something got done is usually the reply -- "did you get the schema
+    document over?" is the match, and "yes, I sent it Thursday night" two lines
+    later is the proof.
+
+    Only the strongest hits are kept. Taking every line that shares any word
+    drags in near-misses -- a task to "send the schema document" also matches
+    "I will send you the pricing this week" on one weak stem -- and those
+    distractors measurably push the judge toward answering "not completed".
+    """
+    from .schema import _STOPWORDS
+
+    def stems(text: str) -> set[str]:
+        cleaned = "".join(c if c.isalnum() else " " for c in text.lower())
+        out = set()
+        for word in cleaned.split():
+            if len(word) <= 2 or word in _STOPWORDS:
+                continue
+            out.add(word[:4] if len(word) >= 4 else word)
+        return out
+
+    wanted = stems(task)
+    if not wanted:
+        return []
+
+    scored = [(len(wanted & stems(u.text)), i) for i, u in enumerate(utterances)]
+    hits = [(score, i) for score, i in scored if score > 0]
+    if not hits:
+        return []
+
+    best = max(score for score, _ in hits)
+    # A single shared stem is weak evidence of relevance. Only when a task has
+    # a rich match (three or more shared words) is it safe to admit slightly
+    # weaker lines alongside it.
+    threshold = best if best <= 2 else best - 1
+    strong = [i for score, i in hits if score >= threshold]
+
+    keep: set[int] = set()
+    for i in strong:
+        for j in range(max(0, i - window), min(len(utterances), i + window + 1)):
+            keep.add(j)
+
+    return [utterances[i].render() for i in sorted(keep)][:limit]
 
 
 def _evidence_supports_completion(quote: str) -> bool:
