@@ -133,4 +133,8 @@ def clean(text: str) -> str:
     text = _FILLER.sub(" ", text)
     text = _REPEAT.sub(r"\1", text)
     text = _WS.sub(" ", text)
-    return text.strip(" ,.-")
+    # Removing a leading "Um," leaves a stray comma; strip that, but keep
+    # terminal punctuation -- sentences that end mid-air read badly in notes
+    # and give the model less signal about where a thought finished.
+    text = text.lstrip(" ,.-")
+    return text.rstrip(" ,-")

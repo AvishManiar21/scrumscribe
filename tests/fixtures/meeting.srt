@@ -1,0 +1,11 @@
+1
+00:00:01,000 --> 00:00:05,400
+Avish: Um, so this week I finished the parser
+
+2
+00:00:05,500 --> 00:00:09,000
+Avish: and started the eval harness.
+
+3
+00:00:09,500 --> 00:00:14,000
+Dr. Chen: Good. What is blocking you?

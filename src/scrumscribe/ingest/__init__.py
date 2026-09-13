@@ -11,7 +11,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from ..transcript import Transcript
+from ..transcript import Transcript, clean as clean_text
 from . import json_ingest, meetily, text, vtt
 
 __all__ = ["load", "detect", "SUPPORTED"]
@@ -62,12 +62,20 @@ def detect(path: Path) -> str:
     return "text"
 
 
-def load(path: Path, meeting_id: str | None = None) -> Transcript:
+def load(
+    path: Path, meeting_id: str | None = None, strip_fillers: bool = True
+) -> Transcript:
     """Load any supported transcript into the common Transcript model.
 
-    Utterances are merged into speaker turns on the way out: raw cue-level
-    segments shred sentences across boundaries and measurably degrade
-    summarisation quality on small models.
+    Two normalisations happen here, both for the benefit of a small model.
+
+    Utterances are merged into speaker turns: raw cue-level segments shred
+    sentences across boundaries and measurably degrade summarisation quality.
+
+    Filler words are stripped. Speech-to-text output is full of "um", "uh" and
+    stutter repeats, and on a 4B model every wasted token is context that is
+    not available for the actual meeting. Pass ``strip_fillers=False`` to keep
+    the transcript verbatim.
     """
     path = Path(path)
     kind = detect(path)
@@ -90,4 +98,14 @@ def load(path: Path, meeting_id: str | None = None) -> Transcript:
             "If this is a Meetily database, run `scrumscribe doctor` to inspect it."
         )
 
-    return transcript.merge_consecutive()
+    transcript = transcript.merge_consecutive()
+
+    if strip_fillers:
+        for utt in transcript.utterances:
+            stripped = clean_text(utt.text)
+            # Never let cleaning empty an utterance -- an all-filler turn
+            # ("um, yeah") still carries that someone spoke.
+            if stripped:
+                utt.text = stripped
+
+    return transcript

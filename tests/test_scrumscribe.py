@@ -18,6 +18,7 @@ from scrumscribe.agent.loop import (
     _dedupe_items,
     _evidence_supports_completion,
     _parse_actions,
+    _retrieve,
     _parse_items,
     _quote_is_real,
 )
@@ -26,6 +27,7 @@ from scrumscribe.ingest import detect, load
 from scrumscribe.ingest.meetily import MeetilyStore
 from scrumscribe.memory import Memory
 from scrumscribe.model import chunk, estimate_tokens
+from scrumscribe.model.ollama import _salvage_json
 from scrumscribe.render import to_markdown, to_terminal
 from scrumscribe.transcript import Transcript, Utterance, clean
 
@@ -402,3 +404,124 @@ def test_fabricated_quotes_are_rejected():
 def test_quote_must_be_substantial():
     """Too short to verify is treated as unverifiable."""
     assert not _quote_is_real("yes", "Avish: yes it is done")
+
+
+# -- srt and filler stripping -------------------------------------------------
+
+
+def test_detect_and_load_srt():
+    path = FIXTURES / "meeting.srt"
+    assert detect(path) == "srt"
+    t = load(path)
+    assert t.speakers == ["Avish", "Dr. Chen"]
+    assert t.utterances[0].start == pytest.approx(1.0)
+
+
+def test_srt_detected_without_extension(tmp_path):
+    odd = tmp_path / "transcript.log"
+    odd.write_text((FIXTURES / "meeting.srt").read_text(encoding="utf-8"), encoding="utf-8")
+    assert detect(odd) == "srt"
+
+
+def test_pipeline_strips_fillers_by_default():
+    t = load(FIXTURES / "meeting.srt")
+    assert not t.utterances[0].text.lower().startswith("um")
+
+
+def test_verbatim_mode_keeps_fillers():
+    t = load(FIXTURES / "meeting.srt", strip_fillers=False)
+    assert t.utterances[0].text.lower().startswith("um")
+
+
+def test_cleaning_keeps_terminal_punctuation():
+    assert clean("Um, so I finished the parser.").endswith(".")
+    assert clean("Uh, what is blocking you?").endswith("?")
+
+
+def test_cleaning_never_empties_an_utterance():
+    """An all-filler turn still records that somebody spoke."""
+    t = Transcript([Utterance("Um, uh, um", 0, 2, "Avish")])
+    for utt in t.utterances:
+        stripped = clean(utt.text)
+        if stripped:
+            utt.text = stripped
+    assert t.utterances[0].text
+
+
+# -- malformed model output ---------------------------------------------------
+
+
+def test_salvage_recovers_truncated_string():
+    """A model that runs out of output budget stops mid-string."""
+    raw = '{\n  "summary": "The team discussed the WCOnline integration and decided to store raw payl'
+    recovered = _salvage_json(raw)
+    assert recovered is not None
+    assert recovered["summary"].startswith("The team discussed")
+
+
+def test_salvage_recovers_truncated_array():
+    raw = '{"action_items": [{"owner": "Avish", "task": "Send sch'
+    recovered = _salvage_json(raw)
+    assert recovered["action_items"][0]["owner"] == "Avish"
+
+
+def test_salvage_strips_surrounding_prose():
+    assert _salvage_json('Sure! {"summary": "done"} hope that helps') == {"summary": "done"}
+
+
+def test_salvage_gives_up_on_garbage():
+    assert _salvage_json("no json here at all") is None
+
+
+def test_salvage_handles_escaped_quotes():
+    raw = '{"summary": "he said \\"done\\" and left'
+    recovered = _salvage_json(raw)
+    assert recovered is not None
+    assert "done" in recovered["summary"]
+
+
+def test_lenient_parsing_allows_raw_newlines():
+    """Constrained decoding fixes the shape, not control-character escaping."""
+    assert _salvage_json('{"summary": "line one\nline two"}')["summary"].count("\n") == 1
+
+
+# -- evidence retrieval -------------------------------------------------------
+
+
+def _week2():
+    return load(FIXTURES / "scrum_week2.txt")
+
+
+def test_retrieval_finds_the_reply_not_just_the_mention():
+    """The proof is usually the answer to the question that matched."""
+    lines = _retrieve("Send the schema document", _week2().utterances)
+    joined = " ".join(lines)
+    assert "schema document over" in joined      # the mention
+    assert "I sent it Thursday night" in joined  # the proof
+
+
+def test_retrieval_window_is_forward_only():
+    """Preceding lines belong to the previous topic and contaminate the judge.
+
+    "Solved, yeah..." sits immediately before the RLS exchange and refers to
+    the rate limit. Pulled in as context it is enough to convince the model
+    that RLS was finished.
+    """
+    lines = _retrieve("Start on RLS", _week2().utterances)
+    joined = " ".join(lines)
+    assert "haven't started it yet" in joined
+    assert "Solved, yeah" not in joined
+
+
+def test_retrieval_returns_nothing_for_unrelated_task():
+    assert _retrieve("Deploy the Kubernetes ingress controller", _week2().utterances) == []
+
+
+def test_retrieval_ignores_stopword_only_tasks():
+    assert _retrieve("do the it", _week2().utterances) == []
+
+
+def test_retrieval_matches_on_word_stems():
+    """"batch" must find "batching"."""
+    lines = _retrieve("Batch appointment history", _week2().utterances)
+    assert any("batching working" in line for line in lines)

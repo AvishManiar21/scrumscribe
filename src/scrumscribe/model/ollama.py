@@ -29,6 +29,10 @@ class Ollama:
     host: str = DEFAULT_HOST
     temperature: float = 0.2  # summarisation wants determinism, not flair
     num_ctx: int = 8192
+    # Ollama's default prediction budget cuts long answers off mid-sentence,
+    # which surfaces as truncated JSON rather than as an error. Extraction
+    # over a dense section legitimately needs more room than the default.
+    num_predict: int = 2048
     timeout: float = 300.0
     retries: int = 2
 
@@ -94,7 +98,11 @@ class Ollama:
             "model": self.model,
             "messages": messages,
             "stream": False,
-            "options": {"temperature": self.temperature, "num_ctx": self.num_ctx},
+            "options": {
+                "temperature": self.temperature,
+                "num_ctx": self.num_ctx,
+                "num_predict": self.num_predict,
+            },
         }
         if schema:
             payload["format"] = schema
@@ -103,8 +111,23 @@ class Ollama:
         for attempt in range(self.retries + 1):
             try:
                 data = self._post("/api/chat", payload)
-                return data.get("message", {}).get("content", "")
-            except (urllib.error.URLError, OSError, TimeoutError, ValueError) as exc:
+                content = data.get("message", {}).get("content", "")
+                if not content.strip():
+                    # Ollama occasionally returns a successful response with no
+                    # content -- most visibly when it is swapping a model in or
+                    # out. Treated as success this silently degrades the caller
+                    # (an empty string parses to nothing, no exception is
+                    # raised, and the result is a mechanical fallback nobody
+                    # notices), so it is treated as a retryable failure.
+                    raise OllamaError("empty response from model")
+                return content
+            except (
+                urllib.error.URLError,
+                OSError,
+                TimeoutError,
+                ValueError,
+                OllamaError,
+            ) as exc:
                 last_error = exc
                 if attempt < self.retries:
                     time.sleep(2 * (attempt + 1))
@@ -123,9 +146,19 @@ class Ollama:
         A single bad chunk must not kill a 45-minute meeting's worth of work,
         so we degrade to `default` and let the caller carry on.
         """
-        raw = self.chat(prompt, system=system, schema=schema)
+        raw = ""
+        for attempt in range(2):
+            raw = self.chat(prompt, system=system, schema=schema)
+            if raw.strip():
+                break
+
         try:
-            parsed = json.loads(raw)
+            # strict=False permits literal newlines and tabs inside strings.
+            # Constrained decoding guarantees the JSON shape but not that the
+            # model escapes control characters, and a summary written across
+            # two lines is otherwise a hard parse failure -- which silently
+            # degraded roughly two runs in three before this was found.
+            parsed = json.loads(raw, strict=False)
         except ValueError:
             parsed = _salvage_json(raw)
 
@@ -135,12 +168,60 @@ class Ollama:
 
 
 def _salvage_json(raw: str) -> dict | None:
-    """Last-ditch extraction of a JSON object from a chatty response."""
+    """Recover a usable object from malformed or truncated model output.
+
+    Two distinct failures land here. A chatty model wraps its JSON in prose,
+    which the brace scan handles. More importantly, a model that runs out of
+    output budget stops mid-string, leaving JSON that is valid right up to the
+    point it was cut off. Closing the open string and brackets recovers the
+    content that was produced -- a summary missing its last half-sentence is
+    far more useful than no summary at all.
+    """
     start = raw.find("{")
-    end = raw.rfind("}")
-    if start == -1 or end <= start:
+    if start == -1:
         return None
+
+    end = raw.rfind("}")
+    if end > start:
+        try:
+            return json.loads(raw[start : end + 1], strict=False)
+        except ValueError:
+            pass
+
+    return _close_truncated(raw[start:])
+
+
+def _close_truncated(fragment: str) -> dict | None:
+    """Close an unterminated JSON fragment and parse what survived."""
+    in_string = False
+    escaped = False
+    stack: list[str] = []
+
+    for char in fragment:
+        if escaped:
+            escaped = False
+            continue
+        if char == "\\":
+            escaped = True
+            continue
+        if char == '"':
+            in_string = not in_string
+            continue
+        if in_string:
+            continue
+        if char in "{[":
+            stack.append(char)
+        elif char in "}]":
+            if stack:
+                stack.pop()
+
+    repaired = fragment
+    if in_string:
+        repaired += '"'
+    for opener in reversed(stack):
+        repaired += "}" if opener == "{" else "]"
+
     try:
-        return json.loads(raw[start : end + 1])
+        return json.loads(repaired, strict=False)
     except ValueError:
         return None

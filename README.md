@@ -156,6 +156,16 @@ by. Any failure leaves the item open. Leaving finished work on the list is
 mildly annoying; deleting unfinished work from the only place it is recorded is
 the failure this tool must not have — so the bias is deliberate and one-sided.
 
+**Model output is treated as untrusted input.** Constrained decoding fixes the
+JSON *shape*, not that strings are escaped or that generation finishes. Both
+bite: a summary written across two lines is invalid JSON under a strict parser,
+and a model that exhausts its output budget stops mid-string. Parsing is
+lenient about control characters, truncated JSON is repaired by closing the
+open string and brackets rather than discarded, and an empty response is
+retried instead of being quietly accepted. Before this, roughly two summaries
+in three silently degraded to a mechanical fallback and extraction was losing
+action items off the end of long sections — with no error anywhere.
+
 **Partial coverage is never hidden.** If sections fail, the count appears in the
 notes. A note that silently dropped three of seventeen sections looks exactly
 like a complete one, and that is how you end up trusting a lie.
@@ -169,9 +179,9 @@ leaves genuinely-finished-but-hedged items open — *"I emailed her but no reply
 yet, I'll follow up"* stays on the list. Close those by hand with
 `scrumscribe close`.
 
-Extraction quality varies run to run at this model size; consolidation usually
-merges duplicate action items but not always. Re-running is cheap and the
-transcript is unchanged, so a poor run costs nothing but time.
+Consolidation usually merges duplicate action items but not always, so the odd
+near-duplicate survives into the notes. Re-running is cheap and the transcript
+is unchanged, so a poor run costs nothing but time.
 
 ## Model choice
 

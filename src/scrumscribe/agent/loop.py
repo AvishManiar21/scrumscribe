@@ -454,14 +454,20 @@ class ScrumAgent:
         return notes
 
 
-def _retrieve(task: str, utterances: list, limit: int = 8, window: int = 2) -> list[str]:
+def _retrieve(task: str, utterances: list, limit: int = 8, lookahead: int = 2) -> list[str]:
     """Pull the lines of a meeting that are plausibly about a given task.
 
     Matching is on four-character stems so "batch" finds "batching" and "start"
-    finds "started". Each hit brings its neighbours along, because the evidence
-    that something got done is usually the reply -- "did you get the schema
-    document over?" is the match, and "yes, I sent it Thursday night" two lines
-    later is the proof.
+    finds "started". Each hit brings the lines *after* it along, because the
+    evidence that something got done is usually the reply -- "did you get the
+    schema document over?" is the match, and "yes, I sent it Thursday night"
+    two lines later is the proof.
+
+    The window is deliberately forward-only. Including preceding lines drags in
+    whatever was being discussed before the topic changed, and an adjacent
+    "Solved, yeah" about the previous subject is enough to convince the model
+    that this task is finished. Evidence follows a mention; it does not precede
+    it.
 
     Only the strongest hits are kept. Taking every line that shares any word
     drags in near-misses -- a task to "send the schema document" also matches
@@ -497,7 +503,7 @@ def _retrieve(task: str, utterances: list, limit: int = 8, window: int = 2) -> l
 
     keep: set[int] = set()
     for i in strong:
-        for j in range(max(0, i - window), min(len(utterances), i + window + 1)):
+        for j in range(i, min(len(utterances), i + lookahead + 1)):
             keep.add(j)
 
     return [utterances[i].render() for i in sorted(keep)][:limit]
