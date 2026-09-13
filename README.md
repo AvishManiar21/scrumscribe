@@ -172,12 +172,16 @@ like a complete one, and that is how you end up trusting a lie.
 
 ## Known limitations
 
-Resolution is tuned to under-close rather than over-close. On the test meetings
-it correctly closes clear completions ("yes, I sent it Thursday night") and
-correctly refuses explicit non-completions ("I haven't started it yet"), but
-leaves genuinely-finished-but-hedged items open — *"I emailed her but no reply
-yet, I'll follow up"* stays on the list. Close those by hand with
-`scrumscribe close`.
+Resolution is tuned to under-close rather than over-close. Across four
+consecutive runs of the two linked test meetings it closed the same two
+genuinely-completed items every time and never once closed *"start on RLS"*,
+which the transcript explicitly says was not started. It does leave
+finished-but-hedged items open — *"I emailed her but no reply yet, I'll follow
+up"* stays on the list. Close those by hand with `scrumscribe close`.
+
+That asymmetry is the design, not a rough edge. The model is nondeterministic,
+so the question is not whether it is ever wrong but which way it is wrong when
+it is.
 
 Consolidation usually merges duplicate action items but not always, so the odd
 near-duplicate survives into the notes. Re-running is cheap and the transcript
