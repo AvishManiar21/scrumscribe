@@ -1,0 +1,22 @@
+# data & recordings — never commit meeting content
+data/
+recordings/
+*.wav
+*.vtt
+*.srt
+notes/
+
+# python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+build/
+dist/
+
+# but the synthetic test fixtures are safe and belong in the repo
+!tests/fixtures/
+!tests/fixtures/**

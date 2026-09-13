@@ -1,0 +1,17 @@
+[00:08] Dr. Chen: Morning Avish. Did you get the schema document over?
+[00:14] Avish: Yes, I sent it Thursday night. Did it come through?
+[00:20] Dr. Chen: It did, I read it on the weekend. The normalization looks right to me.
+[00:28] Avish: Good. I also got the batching working, so the appointment history is fully loaded now. All four years of it.
+[00:40] Dr. Chen: That was the rate limit problem, right? So that's solved.
+[00:46] Avish: Solved, yeah. I ended up pulling it in monthly windows instead of per-appointment.
+[00:56] Dr. Chen: And the row level security?
+[01:03] Avish: I haven't started it yet. I know, it's been on the list for two weeks now.
+[01:12] Dr. Chen: Avish, that one needs to happen. We have the director demo coming up.
+[01:19] Avish: I'll do it this week, I promise. It's the first thing.
+[01:25] Dr. Chen: Did you hear back from Dr. Patel about the no-show definitions?
+[01:32] Avish: I emailed her but no reply yet. I'll follow up.
+[01:40] Dr. Chen: Okay. Anything new blocking you?
+[01:45] Avish: The Supabase free tier is close to its row limit, I'm at about eighty percent. If we load another year of data it'll stop accepting writes.
+[02:00] Dr. Chen: Let me know what the paid tier costs and I'll see if the department can cover it.
+[02:08] Avish: I'll send you the pricing this week.
+[02:14] Dr. Chen: Good. So RLS first, then follow up with Patel, then pricing. See you next week.

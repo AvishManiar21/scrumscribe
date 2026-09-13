@@ -1,0 +1,93 @@
+"""Transcript ingest — format detection and dispatch.
+
+ScrumScribe is deliberately agnostic about where a transcript came from.
+Meetily handles capture today; a Teams export, a Whisper JSON dump, or a
+hand-typed text file work identically. Anything that can be reduced to
+speaker turns is a valid input.
+"""
+
+from __future__ import annotations
+
+import json
+from pathlib import Path
+
+from ..transcript import Transcript
+from . import json_ingest, meetily, text, vtt
+
+__all__ = ["load", "detect", "SUPPORTED"]
+
+SUPPORTED = ("meetily-sqlite", "vtt", "srt", "json", "text")
+
+_SQLITE_MAGIC = b"SQLite format 3\x00"
+
+
+def detect(path: Path) -> str:
+    """Identify a transcript source by content first, extension second.
+
+    Content sniffing matters because Meetily's database has been shipped with
+    several extensions across releases (.db, .sqlite, .sqlite3).
+    """
+    if path.is_dir():
+        raise IsADirectoryError(f"{path} is a directory, not a transcript file")
+
+    try:
+        with path.open("rb") as fh:
+            header = fh.read(16)
+    except OSError as exc:
+        raise FileNotFoundError(f"cannot read {path}: {exc}") from exc
+
+    if header == _SQLITE_MAGIC:
+        return "meetily-sqlite"
+
+    suffix = path.suffix.lower()
+    if suffix == ".vtt":
+        return "vtt"
+    if suffix == ".srt":
+        return "srt"
+    if suffix == ".json":
+        return "json"
+
+    # Extension is missing or lying -- look at the actual bytes.
+    head = path.read_text(encoding="utf-8", errors="replace")[:2000].lstrip()
+    if head.upper().startswith("WEBVTT"):
+        return "vtt"
+    if head.startswith(("{", "[")):
+        try:
+            json.loads(path.read_text(encoding="utf-8", errors="replace"))
+            return "json"
+        except ValueError:
+            pass
+    if "-->" in head:
+        return "srt"
+    return "text"
+
+
+def load(path: Path, meeting_id: str | None = None) -> Transcript:
+    """Load any supported transcript into the common Transcript model.
+
+    Utterances are merged into speaker turns on the way out: raw cue-level
+    segments shred sentences across boundaries and measurably degrade
+    summarisation quality on small models.
+    """
+    path = Path(path)
+    kind = detect(path)
+
+    if kind == "meetily-sqlite":
+        transcript = meetily.load(path, meeting_id)
+    elif kind in ("vtt", "srt"):
+        # The SRT cue grammar is a subset of what the VTT parser accepts.
+        transcript = vtt.load(path)
+        if not transcript:
+            transcript = text.load(path)
+    elif kind == "json":
+        transcript = json_ingest.load(path)
+    else:
+        transcript = text.load(path)
+
+    if not transcript:
+        raise ValueError(
+            f"Parsed {path.name} as '{kind}' but found no utterances. "
+            "If this is a Meetily database, run `scrumscribe doctor` to inspect it."
+        )
+
+    return transcript.merge_consecutive()

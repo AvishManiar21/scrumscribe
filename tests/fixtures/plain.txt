@@ -1,0 +1,4 @@
+[00:01] Avish: I finished the parser this week.
+Also started the eval harness.
+[00:45] Dr. Chen: Good, what is blocking you?
+[01:02] Avish: The GPU queue is full.

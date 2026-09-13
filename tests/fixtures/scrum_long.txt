@@ -1,0 +1,26 @@
+[00:12] Dr. Chen: Alright Avish, let's do the weekly. Where are we on the STEM center dashboard?
+[00:20] Avish: So this week I finished the WCOnline data sync. It pulls the tutor schedules every night and writes them into Supabase. That was the big one.
+[00:38] Avish: I also cleaned up the Next.js routing, the hydration error you saw last time is gone now.
+[00:51] Dr. Chen: Good, I noticed that. Did you get the appointment history table loaded?
+[01:02] Avish: Partially. The schedules are in, but appointment history is still empty because I'm hitting the WCOnline API rate limit. It cuts me off around four hundred requests.
+[01:20] Dr. Chen: Can you batch those requests instead of firing them one at a time?
+[01:27] Avish: I think so, yes. Their API supports a date range parameter, I just haven't wired it up.
+[01:36] Dr. Chen: Do that. And send me the schema document before Friday so I can look at it over the weekend.
+[01:44] Avish: Okay, schema doc by Friday, and I'll batch the requests.
+[01:52] Dr. Chen: What about the authentication piece? Last time we said you'd look at row level security.
+[02:03] Avish: That's still open, I haven't started. I wanted to get the data in first before locking it down.
+[02:14] Dr. Chen: That's reasonable, but don't leave it too long. If we demo this to the center director with no auth on it that's a problem.
+[02:26] Avish: Understood. I'll do RLS right after the appointment history is loading.
+[02:35] Dr. Chen: One more thing. I was talking to Dr. Patel and she suggested we track no-show rates per tutor, not just per student. Is that hard?
+[02:48] Avish: Not hard, it's the same table, just a different group by. But I'd want to check with her what counts as a no-show, because right now we have three different status codes that could mean that.
+[03:05] Dr. Chen: Fair. Email her and ask, copy me.
+[03:11] Avish: Will do.
+[03:15] Dr. Chen: How's your GPU situation, are you still queuing?
+[03:21] Avish: Yeah, the shared cluster is backed up so I've been running the embedding jobs locally overnight. It works but it's slow, about six hours a run.
+[03:34] Dr. Chen: If it becomes a bottleneck let me know, I can ask for an allocation. Anything blocking you otherwise?
+[03:44] Avish: Just the rate limit really. And I'm not sure whether we should store the raw WCOnline payloads or only the normalized tables. Storage is cheap but it's duplicated data.
+[04:00] Dr. Chen: Store the raw payloads. If their API changes or we find a bug in the normalizer we'll want to reprocess without re-fetching. That's decided.
+[04:14] Avish: Okay, raw payloads go into a separate bucket then.
+[04:20] Dr. Chen: Right. So for next week: batched appointment history, schema doc by Friday, email Dr. Patel, and start on RLS. Sound right?
+[04:33] Avish: Yes, that's the list.
+[04:36] Dr. Chen: Good work on the sync. Talk next week.

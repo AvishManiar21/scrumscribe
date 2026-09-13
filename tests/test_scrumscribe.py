@@ -1,0 +1,404 @@
+"""Offline test suite.
+
+Nothing here touches Ollama. These tests cover the deterministic machinery --
+parsing, chunking, deduplication, persistence -- which is exactly the part that
+must not regress, and the part a model-dependent test could never pin down.
+"""
+
+from __future__ import annotations
+
+import json
+import sqlite3
+from pathlib import Path
+
+import pytest
+
+from scrumscribe.agent.loop import (
+    _dedupe_actions,
+    _dedupe_items,
+    _evidence_supports_completion,
+    _parse_actions,
+    _parse_items,
+    _quote_is_real,
+)
+from scrumscribe.agent.schema import ActionItem, Item, ScrumNotes
+from scrumscribe.ingest import detect, load
+from scrumscribe.ingest.meetily import MeetilyStore
+from scrumscribe.memory import Memory
+from scrumscribe.model import chunk, estimate_tokens
+from scrumscribe.render import to_markdown, to_terminal
+from scrumscribe.transcript import Transcript, Utterance, clean
+
+FIXTURES = Path(__file__).parent / "fixtures"
+
+
+# -- transcript model ---------------------------------------------------------
+
+
+def test_merge_consecutive_joins_same_speaker():
+    t = Transcript(
+        [
+            Utterance("I finished the parser", 0, 3, "Avish"),
+            Utterance("and the eval script.", 3.5, 6, "Avish"),
+            Utterance("Good.", 7, 8, "Chen"),
+        ]
+    )
+    merged = t.merge_consecutive()
+    assert len(merged) == 2
+    assert merged.utterances[0].text == "I finished the parser and the eval script."
+    assert merged.utterances[0].end == 6
+
+
+def test_merge_respects_gap_threshold():
+    t = Transcript(
+        [
+            Utterance("First thought.", 0, 3, "Avish"),
+            Utterance("Much later thought.", 60, 63, "Avish"),
+        ]
+    )
+    assert len(t.merge_consecutive(max_gap=2.0)) == 2
+
+
+def test_clean_strips_fillers_and_stutters():
+    assert "um" not in clean("Um, I I finished it").lower()
+    assert clean("I I finished it") == "I finished it"
+
+
+def test_speakers_preserve_order():
+    t = Transcript(
+        [
+            Utterance("a", speaker="Chen"),
+            Utterance("b", speaker="Avish"),
+            Utterance("c", speaker="Chen"),
+        ]
+    )
+    assert t.speakers == ["Chen", "Avish"]
+
+
+# -- ingest -------------------------------------------------------------------
+
+
+def test_detect_and_load_vtt():
+    path = FIXTURES / "teams.vtt"
+    assert detect(path) == "vtt"
+    t = load(path)
+    assert "Avish Maniar" in t.speakers
+    assert t.utterances[0].start == pytest.approx(1.0)
+
+
+def test_vtt_voice_tags_are_stripped():
+    t = load(FIXTURES / "teams.vtt")
+    assert all("<v" not in u.text for u in t.utterances)
+
+
+def test_detect_and_load_json():
+    assert detect(FIXTURES / "whisper.json") == "json"
+    t = load(FIXTURES / "whisper.json")
+    assert len(t) >= 2
+    assert t.speakers
+
+
+def test_detect_and_load_text():
+    assert detect(FIXTURES / "plain.txt") == "text"
+    t = load(FIXTURES / "plain.txt")
+    assert t.speakers == ["Avish", "Dr. Chen"]
+
+
+def test_sqlite_detected_by_magic_bytes(tmp_path):
+    """Extension is irrelevant; Meetily has shipped several."""
+    odd = tmp_path / "store.bin"
+    odd.write_bytes((FIXTURES / "fake_meetily.db").read_bytes())
+    assert detect(odd) == "meetily-sqlite"
+
+
+def test_meetily_schema_discovery_picks_transcript_table():
+    with MeetilyStore(FIXTURES / "fake_meetily.db") as store:
+        best = store.best
+        assert best.table == "transcript_chunks"
+        assert best.text == "transcript_text"
+        assert best.speaker == "speaker_label"
+        # The long-blob summaries table must never outrank the real one.
+        assert best.score > max(t.score for t in store.tables[1:])
+
+
+def test_meetily_lists_and_filters_meetings():
+    with MeetilyStore(FIXTURES / "fake_meetily.db") as store:
+        meetings = store.list_meetings()
+        assert [m["id"] for m in meetings] == ["m1", "m2"]  # newest first
+        assert len(store.load("m1")) == 4
+        assert len(store.load("m2")) == 1
+
+
+def test_meetily_opened_read_only(tmp_path):
+    copy = tmp_path / "ro.db"
+    copy.write_bytes((FIXTURES / "fake_meetily.db").read_bytes())
+    with MeetilyStore(copy) as store:
+        with pytest.raises(sqlite3.OperationalError):
+            store.conn.execute("CREATE TABLE nope (x INTEGER)")
+
+
+def test_empty_transcript_raises_useful_error(tmp_path):
+    empty = tmp_path / "empty.txt"
+    empty.write_text("   \n\n  ", encoding="utf-8")
+    with pytest.raises(ValueError, match="no utterances"):
+        load(empty)
+
+
+# -- chunking -----------------------------------------------------------------
+
+
+def _long_transcript(n: int) -> Transcript:
+    return Transcript(
+        [Utterance("word " * 40, i * 10.0, i * 10.0 + 8, f"S{i % 3}") for i in range(n)]
+    )
+
+
+@pytest.mark.parametrize("n,max_tokens", [(1, 1800), (5, 100), (50, 400), (500, 1800)])
+def test_chunks_partition_transcript_exactly(n, max_tokens):
+    """Every utterance appears in exactly one chunk. No loss, no duplication."""
+    t = _long_transcript(n)
+    chunks = chunk(t, max_tokens=max_tokens)
+    owned = [u for c in chunks for u in c.utterances]
+    assert len(owned) == n
+    assert [id(u) for u in owned] == [id(u) for u in t.utterances]
+
+
+def test_oversized_utterance_gets_its_own_chunk():
+    t = Transcript([Utterance("word " * 5000, 0, 10, "Avish")])
+    chunks = chunk(t, max_tokens=100)
+    assert len(chunks) == 1
+    assert chunks[0].utterances
+
+
+def test_overlap_is_context_not_content():
+    t = _long_transcript(20)
+    chunks = chunk(t, max_tokens=300, overlap_utterances=2)
+    assert len(chunks) > 1
+    assert chunks[1].context
+    # Context must be lead-in from the previous chunk, never owned content.
+    assert not set(id(u) for u in chunks[1].context) & set(
+        id(u) for u in chunks[1].utterances
+    )
+    assert "earlier context" in chunks[1].render_with_context()
+
+
+def test_empty_transcript_yields_no_chunks():
+    assert chunk(Transcript([])) == []
+
+
+def test_token_estimate_is_monotonic():
+    assert estimate_tokens("a" * 100) < estimate_tokens("a" * 200)
+
+
+# -- extraction parsing and dedupe --------------------------------------------
+
+def test_placeholder_due_dates_are_dropped():
+    actions = _parse_actions(
+        [
+            {"owner": "Avish", "task": "Email Patel", "due": "unassigned"},
+            {"owner": "Avish", "task": "Start RLS", "due": "N/A"},
+            {"owner": "Avish", "task": "Send schema", "due": "Friday"},
+        ]
+    )
+    assert [a.due for a in actions] == ["", "", "Friday"]
+
+
+def test_parse_actions_tolerates_bare_strings():
+    actions = _parse_actions(["do the thing", {"task": "other thing"}])
+    assert [a.task for a in actions] == ["do the thing", "other thing"]
+
+
+def test_parse_items_ignores_empty_details():
+    assert _parse_items([{"owner": "A", "detail": ""}, {"owner": "A", "detail": "x"}]) == [
+        Item("A", "x")
+    ]
+
+
+def test_dedupe_prefers_named_owner_and_longer_text():
+    merged = _dedupe_items(
+        [
+            Item("unassigned", "finished the WCOnline sync"),
+            Item("Avish", "Finished the WCOnline sync."),
+        ]
+    )
+    assert len(merged) == 1
+    assert merged[0].owner == "Avish"
+
+
+def test_dedupe_actions_keeps_due_date():
+    merged = _dedupe_actions(
+        [
+            ActionItem("Avish", "send the schema doc", ""),
+            ActionItem("Avish", "Send the schema doc", "Friday"),
+        ]
+    )
+    assert len(merged) == 1
+    assert merged[0].due == "Friday"
+
+
+def test_dedupe_resolves_conflicting_owners():
+    """The doer owns more items than the requester, so the doer wins."""
+    merged = _dedupe_actions(
+        [
+            ActionItem("Avish", "Email Dr. Patel"),
+            ActionItem("Dr. Chen", "Email Dr. Patel"),
+            ActionItem("Avish", "Start on RLS"),
+            ActionItem("Avish", "Send schema doc", "Friday"),
+        ]
+    )
+    tasks = {a.task: a.owner for a in merged}
+    assert len(merged) == 3
+    assert tasks["Email Dr. Patel"] == "Avish"
+
+
+def test_distinct_tasks_survive_dedupe():
+    merged = _dedupe_actions(
+        [ActionItem("Avish", "Start on RLS"), ActionItem("Avish", "Email Dr. Patel")]
+    )
+    assert len(merged) == 2
+
+
+# -- memory -------------------------------------------------------------------
+
+
+def test_memory_tracks_carry_over_and_resolution(tmp_path):
+    memory = Memory(tmp_path / "memory.json")
+
+    week1 = ScrumNotes(
+        title="Scrum",
+        date="2026-09-01",
+        action_items=[
+            ActionItem("Avish", "send schema doc", "Friday"),
+            ActionItem("Avish", "batch the API requests"),
+        ],
+    )
+    assert memory.record(week1) == {"added": 2, "closed": 0, "carried": 0}
+
+    week2 = ScrumNotes(
+        title="Scrum",
+        date="2026-09-08",
+        action_items=[ActionItem("Avish", "send schema doc", "Friday")],
+        resolved=[ActionItem("Avish", "batch the API requests")],
+    )
+    report = memory.record(week2)
+    assert report["closed"] == 1
+    assert report["carried"] == 1
+
+    open_items = memory.open_items()
+    assert len(open_items) == 1
+    assert open_items[0].meetings == 2  # survived two meetings
+
+
+def test_memory_survives_reload(tmp_path):
+    path = tmp_path / "memory.json"
+    Memory(path).record(
+        ScrumNotes(title="S", date="2026-09-01", action_items=[ActionItem("A", "task one")])
+    )
+    assert len(Memory(path).open_items()) == 1
+
+
+def test_memory_recovers_from_corruption(tmp_path):
+    path = tmp_path / "memory.json"
+    path.write_text("{ this is not json", encoding="utf-8")
+    memory = Memory(path)  # must not raise
+    assert memory.open_items() == []
+    assert path.with_suffix(".corrupt.json").exists()
+
+
+def test_rerunning_a_meeting_does_not_duplicate_it(tmp_path):
+    memory = Memory(tmp_path / "memory.json")
+    notes = ScrumNotes(title="Scrum", date="2026-09-01", action_items=[ActionItem("A", "t")])
+    memory.record(notes)
+    memory.record(notes)
+    assert len(memory.meetings()) == 1
+    assert len(memory.open_items()) == 1
+
+
+def test_close_item_by_text_and_by_key(tmp_path):
+    memory = Memory(tmp_path / "memory.json")
+    memory.record(
+        ScrumNotes(
+            title="S",
+            date="2026-09-01",
+            action_items=[ActionItem("A", "email Dr. Patel"), ActionItem("A", "start RLS")],
+        )
+    )
+    assert memory.close_item("patel") is not None
+    remaining = memory.open_items()
+    assert len(remaining) == 1
+    assert memory.close_item(remaining[0].key()) is not None
+    assert memory.open_items() == []
+
+
+def test_memory_write_is_atomic(tmp_path):
+    path = tmp_path / "memory.json"
+    memory = Memory(path)
+    memory.record(ScrumNotes(title="S", date="2026-09-01"))
+    # No temporary files left behind, and the result is valid JSON.
+    assert not list(tmp_path.glob(".memory-*.tmp"))
+    json.loads(path.read_text(encoding="utf-8"))
+
+
+# -- rendering ----------------------------------------------------------------
+
+
+def test_markdown_omits_empty_sections():
+    md = to_markdown(ScrumNotes(title="S", date="2026-09-01", summary="Nothing much."))
+    assert "## Blockers" not in md
+    assert "## Action items" not in md
+
+
+def test_markdown_flags_partial_coverage():
+    notes = ScrumNotes(title="S", date="2026-09-01", chunks=17, failed_chunks=3)
+    md = to_markdown(notes)
+    assert "incomplete" in md
+    assert "3 of 17" in md
+
+
+def test_markdown_marks_long_running_items():
+    notes = ScrumNotes(
+        title="S",
+        date="2026-09-01",
+        carried_over=[ActionItem("Avish", "start RLS", meetings=4)],
+    )
+    md = to_markdown(notes)
+    assert "open for 4 meetings" in md
+    assert "Still open from previous meetings" in md
+
+
+def test_terminal_render_warns_on_failed_chunks():
+    out = to_terminal(ScrumNotes(title="S", date="x", chunks=5, failed_chunks=2))
+    assert "WARNING" in out
+
+
+# -- resolution safety rails --------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "quote,expected",
+    [
+        ("Avish: Yes, I sent it Thursday night.", True),
+        ("Avish: Batching is working, appointment history is fully loaded now.", True),
+        ("Avish: Solved, yeah. I pulled it in monthly windows.", True),
+        ("Avish: I haven't started it yet, it's been on the list two weeks.", False),
+        ("Avish: I'll do it this week, I promise.", False),
+        ("Avish: I emailed her but no reply yet. I'll follow up.", False),
+        ("Dr. Chen: That one needs to happen before the demo.", False),
+    ],
+)
+def test_evidence_screen_rejects_unfinished_work(quote, expected):
+    """The screen fails closed: ambiguity leaves an item open."""
+    assert _evidence_supports_completion(quote) is expected
+
+
+def test_fabricated_quotes_are_rejected():
+    transcript = "[00:14] Avish: Yes, I sent the schema document Thursday night."
+    assert _quote_is_real("I sent the schema document Thursday", transcript)
+    assert not _quote_is_real(
+        "I deployed the authentication middleware to production", transcript
+    )
+
+
+def test_quote_must_be_substantial():
+    """Too short to verify is treated as unverifiable."""
+    assert not _quote_is_real("yes", "Avish: yes it is done")

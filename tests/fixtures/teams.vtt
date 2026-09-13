@@ -1,0 +1,13 @@
+WEBVTT
+
+00:00:01.000 --> 00:00:05.400
+<v Avish Maniar>Um, so this week I finished the WCOnline sync</v>
+
+00:00:05.500 --> 00:00:09.000
+<v Avish Maniar>and pushed the Supabase migration.</v>
+
+00:00:09.500 --> 00:00:14.000
+<v Dr. Chen>Good. Is the tutor availability table populated yet?</v>
+
+00:00:14.200 --> 00:00:20.000
+<v Avish Maniar>Not yet, I'm blocked on the API rate limit.</v>
