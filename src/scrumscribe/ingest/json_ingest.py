@@ -13,8 +13,13 @@ from typing import Any
 from ..transcript import Transcript, Utterance
 
 TEXT_KEYS = ("text", "transcript", "content", "sentence", "value", "body")
-START_KEYS = ("start", "start_time", "startTime", "begin", "from", "offset", "ts")
-END_KEYS = ("end", "end_time", "endTime", "stop", "to")
+# Meetily's recording export names these `audio_start_time` / `audio_end_time`,
+# which no generic alias list would guess. Listed first so they win outright.
+START_KEYS = (
+    "audio_start_time", "start", "start_time", "startTime",
+    "begin", "from", "offset", "ts",
+)
+END_KEYS = ("audio_end_time", "end", "end_time", "endTime", "stop", "to")
 SPEAKER_KEYS = ("speaker", "speaker_label", "speakerName", "who", "name", "participant")
 
 

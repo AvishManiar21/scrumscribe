@@ -29,6 +29,11 @@ def _action_line(action: ActionItem, show_age: bool = False) -> str:
     return line
 
 
+def _prefixed(owner: str, text: str) -> str:
+    """Terminal line, without a dangling owner when nobody was attributed."""
+    return f"{owner}: {text}" if owner and owner != UNASSIGNED else text
+
+
 def to_markdown(notes: ScrumNotes) -> str:
     out: list[str] = []
     out.append(f"# {notes.title}")
@@ -37,6 +42,10 @@ def to_markdown(notes: ScrumNotes) -> str:
     meta = [f"**Date:** {notes.date}"]
     if notes.participants:
         meta.append(f"**Participants:** {', '.join(notes.participants)}")
+    else:
+        # Be explicit rather than leaving the reader to wonder why nothing is
+        # attributed. Meetily's recording export carries no speaker labels.
+        meta.append("**Participants:** _not labelled in this transcript_")
     out.append("  \n".join(meta))
     out.append("")
 
@@ -55,7 +64,7 @@ def to_markdown(notes: ScrumNotes) -> str:
         out.append("## ✅ Closed this meeting")
         out.append("")
         for action in notes.resolved:
-            out.append(f"- [x] **{action.owner}**: {action.task}")
+            out.append(f"- [x] {_prefixed(action.owner, action.task)}")
         out.append("")
 
     if notes.progress:
@@ -132,16 +141,16 @@ def to_terminal(notes: ScrumNotes) -> str:
         block(
             "STILL OPEN FROM BEFORE",
             [
-                f"{a.owner}: {a.task}"
+                _prefixed(a.owner, a.task)
                 + (f" (open {a.meetings} meetings)" if a.meetings > 1 else "")
                 for a in notes.carried_over
             ],
         )
-    block("PROGRESS", [f"{i.owner}: {i.detail}" for i in notes.progress])
-    block("BLOCKERS", [f"{i.owner}: {i.detail}" for i in notes.blockers])
-    block("FEEDBACK", [f"{i.owner}: {i.detail}" for i in notes.feedback])
+    block("PROGRESS", [_prefixed(i.owner, i.detail) for i in notes.progress])
+    block("BLOCKERS", [_prefixed(i.owner, i.detail) for i in notes.blockers])
+    block("FEEDBACK", [_prefixed(i.owner, i.detail) for i in notes.feedback])
     block("DECISIONS", notes.decisions)
-    block("ACTION ITEMS", [f"{a.owner}: {a.label()}" for a in notes.action_items])
+    block("ACTION ITEMS", [_prefixed(a.owner, a.label()) for a in notes.action_items])
     block("OPEN QUESTIONS", notes.questions)
 
     if notes.failed_chunks:

@@ -23,7 +23,7 @@ from scrumscribe.agent.loop import (
     _parse_items,
     _quote_is_real,
 )
-from scrumscribe.agent.schema import ActionItem, Item, ScrumNotes
+from scrumscribe.agent.schema import UNASSIGNED, ActionItem, Item, ScrumNotes
 from scrumscribe.ingest import detect, load
 from scrumscribe.ingest import meetily_folder
 from scrumscribe.ingest.meetily import (
@@ -674,3 +674,38 @@ def test_plain_directory_is_rejected(tmp_path):
     (tmp_path / "notes").mkdir()
     with pytest.raises(IsADirectoryError, match="Meetily recording"):
         detect(tmp_path / "notes")
+
+
+# -- unlabelled transcripts ---------------------------------------------------
+
+
+def test_unlabelled_utterance_has_no_speaker_prefix():
+    """Printing "Unknown:" teaches the model that Unknown is a participant."""
+    assert Utterance("hello there", 5, 8).render() == "[00:05] hello there"
+    assert "Unknown" not in Utterance("hello there").render()
+
+
+@pytest.mark.parametrize("value", ["Unknown", "unknown speaker", "the team", "N/A", "someone", ""])
+def test_placeholder_owners_normalise_to_unassigned(value):
+    items = _parse_items([{"owner": value, "detail": "did the thing"}])
+    assert items[0].owner == UNASSIGNED
+
+
+def test_real_owner_names_survive():
+    items = _parse_items([{"owner": "Dr. Chen", "detail": "asked for the diagram"}])
+    assert items[0].owner == "Dr. Chen"
+
+
+def test_render_omits_empty_owners():
+    notes = ScrumNotes(
+        title="S",
+        date="2026-09-13",
+        progress=[Item(UNASSIGNED, "shipped the booking form")],
+        action_items=[ActionItem(UNASSIGNED, "migrate to Postgres", "next week")],
+    )
+    md, term = to_markdown(notes), to_terminal(notes)
+    for text in (md, term):
+        assert "unassigned" not in text
+        assert "Unknown" not in text
+    assert "shipped the booking form" in term
+    assert "not labelled in this transcript" in md

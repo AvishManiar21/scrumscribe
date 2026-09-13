@@ -34,10 +34,20 @@ class Utterance:
         return f"{minutes:02d}:{seconds:02d}"
 
     def render(self) -> str:
+        """Render for display and for the model prompt.
+
+        An unlabelled utterance gets no speaker prefix at all. Printing a
+        placeholder like "Unknown:" teaches the model that "Unknown" is a
+        participant, and it then dutifully attributes action items to them.
+        """
         ts = self.timestamp()
-        who = self.speaker or "Unknown"
-        prefix = f"[{ts}] {who}:" if ts else f"{who}:"
-        return f"{prefix} {self.text}"
+        parts = []
+        if ts:
+            parts.append(f"[{ts}]")
+        if self.speaker:
+            parts.append(f"{self.speaker}:")
+        parts.append(self.text)
+        return " ".join(parts)
 
 
 @dataclass

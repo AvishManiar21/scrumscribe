@@ -58,6 +58,20 @@ def _as_text(value) -> str:
     return str(value).strip()
 
 
+# Words a model returns when it has no real name to give. Left as-is they
+# render as though "Unknown" were a member of the team.
+_NON_OWNERS = {
+    "", "unknown", "unassigned", "n/a", "na", "none", "null", "speaker",
+    "unspecified", "unidentified", "someone", "team", "the team", "participant",
+    "user", "unknown speaker", "not specified", "everyone", "all",
+}
+
+
+def _owner_or_unassigned(value) -> str:
+    owner = _as_text(value)
+    return UNASSIGNED if owner.lower().strip(" .:-") in _NON_OWNERS else owner
+
+
 def _parse_items(rows) -> list[Item]:
     items: list[Item] = []
     if not isinstance(rows, list):
@@ -65,7 +79,7 @@ def _parse_items(rows) -> list[Item]:
     for row in rows:
         if isinstance(row, dict):
             detail = _as_text(row.get("detail") or row.get("text"))
-            owner = _as_text(row.get("owner")) or UNASSIGNED
+            owner = _owner_or_unassigned(row.get("owner"))
         else:
             detail, owner = _as_text(row), UNASSIGNED
         if detail:
@@ -86,7 +100,7 @@ def _parse_actions(rows) -> list[ActionItem]:
     for row in rows:
         if isinstance(row, dict):
             task = _as_text(row.get("task") or row.get("detail"))
-            owner = _as_text(row.get("owner")) or UNASSIGNED
+            owner = _owner_or_unassigned(row.get("owner"))
             due = _as_text(row.get("due"))
         else:
             task, owner, due = _as_text(row), UNASSIGNED, ""

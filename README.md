@@ -201,6 +201,13 @@ That asymmetry is the design, not a rough edge. The model is nondeterministic,
 so the question is not whether it is ever wrong but which way it is wrong when
 it is.
 
+Meetily's recording export carries **no speaker labels**, so notes made from a
+recording folder have limited attribution — the model infers an owner from
+context when it can and leaves it blank otherwise, and the notes say so rather
+than implying nobody was responsible. Sources that do carry speakers (Teams
+`.vtt`, or Meetily's database once a meeting is saved in the app) attribute
+properly.
+
 Consolidation usually merges duplicate action items but not always, so the odd
 near-duplicate survives into the notes. Re-running is cheap and the transcript
 is unchanged, so a poor run costs nothing but time.

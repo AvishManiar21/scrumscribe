@@ -120,7 +120,16 @@ def load(
             "If this is a Meetily database, run `scrumscribe doctor` to inspect it."
         )
 
-    transcript = transcript.merge_consecutive()
+    # Merging is only safe when a source carries speaker labels, because a
+    # change of speaker is what ends a turn. Meetily's recording export has no
+    # diarisation, and its pauses between speakers are no longer than its
+    # pauses mid-sentence -- measured on a real recording, every gap fell below
+    # 0.9s, so any threshold that joins a speaker's own sentences also welds
+    # the whole meeting into a single block. Left unmerged, the segment
+    # boundaries at least track sentences, which is the structure the model
+    # needs to tell a question from its answer.
+    if any(u.speaker for u in transcript.utterances):
+        transcript = transcript.merge_consecutive()
 
     if strip_fillers:
         for utt in transcript.utterances:
