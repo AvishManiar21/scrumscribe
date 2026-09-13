@@ -50,7 +50,7 @@ matched against later meetings, and flagged when it has been open too long.
 Requires Python 3.10+ and [Ollama](https://ollama.com).
 
 ```bash
-git clone https://github.com/<you>/scrumscribe
+git clone https://github.com/AvishManiar21/scrumscribe
 cd scrumscribe
 python -m venv .venv && .venv/Scripts/activate     # Windows
 pip install -e .
